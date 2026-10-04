@@ -81,54 +81,123 @@ logger = logging.getLogger("restriction-service")
 RESERVATION_WORKER_INTERVAL = float(
     os.environ.get("RESERVATION_WORKER_INTERVAL", "0.5")
 )
+# 到期预约有界取数：每轮按 (execute_at, id) 键集游标最多枚举的预约数，
+# 与积压总量无关；一轮排空前会连续翻页（每页一次只读短查询）。
+# 因此即使待执行预约暴涨，单次取数与执行器内存占用也保持有界。
+RESERVATION_WORKER_FETCH_LIMIT = int(
+    os.environ.get("RESERVATION_WORKER_FETCH_LIMIT", "100")
+)
 _reservation_worker_stop = threading.Event()
 _reservation_worker_thread: threading.Thread | None = None
 
 
-def process_due_reservations() -> list[int]:
-    """处理全部到期待执行预约，返回本轮处理过的预约编号（按处理顺序）。
+def _execute_one_reservation(reservation_id: int) -> dict | None:
+    """在**独立写事务**（独立借出的池连接）内执行一条到期预约。
 
-    到期集合按 (execute_at, id) 升序取出后逐个在**独立写事务**内执行：
-    每条预约的重验、区域变更与状态翻转同一事务提交，单条失败（含未预期
-    错误回滚留待下轮重试）不影响后续预约。执行器与取消在同一预约行锁上
-    竞争，与所有区域写入在 region_meta 行锁上串行化。
+    业务重验失败（沿用批量变更错误码）已在 execute_reservation 内置
+    failed 并随本事务提交；未预期故障（如数据库错误）则整事务回滚，
+    预约保持 pending 供后续轮次/重启后重试。返回预约最新行；编号不存在
+    时返回 None。连接在返回前归还连接池，处理期间不会长期占用。
     """
-    processed: list[int] = []
     with db.pool.connection() as conn:
         conn.rollback()  # 确保从连接池拿到的连接没有残留事务
         with conn.cursor() as cur:
             repository.configure_cursor(cur)
-            due_ids = repository.list_due_reservation_ids(
-                cur, repository.utcnow()
-            )
-        conn.commit()  # 只读取出到期集合，释放快照
-        for reservation_id in due_ids:
-            conn.rollback()
+            try:
+                row = repository.execute_reservation(cur, reservation_id)
+            except Exception:
+                # 未预期错误：整事务回滚，预约保持 pending，下一轮（或重启
+                # 后）从头重扫时重试；业务重验失败已在 execute_reservation
+                # 内落为 failed 并正常提交，不会走到这里
+                conn.rollback()
+                logger.exception(
+                    "预约 %s 执行出现未预期错误，留待下一轮重试", reservation_id
+                )
+                return None
+            else:
+                conn.commit()  # 状态翻转与区域变更同一事务提交后立即归还连接
+        return row
+
+
+def process_due_reservations(
+    fetch_limit: int | None = None,
+    should_continue=None,
+) -> list[int]:
+    """有界取数、持续推进地处理全部到期待执行预约。
+
+    返回本轮**真正到达终态**的预约编号（按 (execute_at, id) 处理顺序，
+    至多保留本页大小，与积压总量无关）。
+
+    * **有界键集翻页**：每次只读短查询取至多 ``fetch_limit+1`` 行（多一行
+      判定是否还有下一页），游标为 (execute_at, id)，命中
+      (status, execute_at, id) 索引——单次取数与内存占用不随待执行总量
+      线性增长；一页排完立即翻下一页继续，直到没有更多到期预约。
+    * **逐条独立写事务**：每条预约在独立借出的池连接内重验并提交/回滚，
+      连接随即归还；后台执行器不长期占用连接，处理期间普通 HTTP 请求仍
+      可从连接池获得连接。
+    * **游标只进不退**：每条预约（提交/业务失败/未预期故障）尝试后游标都
+      推进——反复未预期故障的单条保持 pending 但不饿死后续到期预约，下
+      一轮从头重扫时再重试。
+    * 每条在写事务内按处理时的 revision、区域、轨迹、凭证及承诺状态重验；
+      业务拒绝沿用批量变更失败码并置 failed；多实例并发时同一预约由预约行
+      FOR UPDATE + 同事务状态翻转保证至多提交一次，取消与执行只产生一个
+      终态；崩溃回滚后重扫可接续积压。
+
+    ``should_continue`` 若提供，在每条预约处理前调用，返回 False 时提前
+    结束本轮（供关停时快速退出；已到期未处理的预约下一轮继续）。
+    """
+    page_size = RESERVATION_WORKER_FETCH_LIMIT if fetch_limit is None else fetch_limit
+    page_size = max(1, page_size)
+    terminal: list[int] = []
+    # 键集游标：None 表示首页；之后为上一页最后一条（也是最后一次尝试的）
+    # 预约的 (execute_at, id)——无论它最终 committed/failed 还是回滚 pending，
+    # 游标都越过它，保证反复故障的单条不能卡住后续预约
+    cursor_at: datetime | None = None
+    cursor_id = 0
+    while True:
+        if should_continue is not None and not should_continue():
+            break
+        with db.pool.connection() as conn:
+            conn.rollback()  # 确保从连接池拿到的连接没有残留事务
             with conn.cursor() as cur:
                 repository.configure_cursor(cur)
-                try:
-                    row = repository.execute_reservation(cur, reservation_id)
-                except Exception:
-                    # 未预期错误（如数据库故障）：整事务回滚，预约保持
-                    # pending，下一轮（或重启后）重试；业务重验失败已在
-                    # execute_reservation 内落为 failed，不会走到这里
-                    conn.rollback()
-                    logger.exception(
-                        "预约 %s 执行出现未预期错误，留待下一轮重试", reservation_id
-                    )
-                    continue
-                else:
-                    conn.commit()
-            # 仅统计本轮真正执行的预约（取出到加锁之间被并发取消/执行的除外）
-            if row is not None and row["status"] in ("committed", "failed"):
-                processed.append(reservation_id)
-    return processed
+                page = repository.list_due_reservation_id_page(
+                    cur,
+                    repository.utcnow(),
+                    page_size,
+                    cursor_at,
+                    cursor_id,
+                )
+            conn.commit()  # 只读枚举即释放，不在枚举期间持有事务/快照
+        if not page:
+            break
+        has_more = len(page) > page_size
+        page = page[:page_size]
+        for row in page:
+            if should_continue is not None and not should_continue():
+                return terminal
+            reservation_id = row["id"]
+            latest = _execute_one_reservation(reservation_id)
+            # 仅统计本轮真正到达终态的预约（枚举到加锁间被并发取消/执行、
+            # 或未预期故障回滚仍为 pending 的除外）
+            if latest is not None and latest["status"] in ("committed", "failed"):
+                terminal.append(reservation_id)
+            # 游标只进：即使该条回滚 pending（未预期故障）也越过，下轮再试
+            cursor_at = row["execute_at"]
+            cursor_id = reservation_id
+        if not has_more:
+            break
+    return terminal
 
 
 def _reservation_worker_loop() -> None:
     while not _reservation_worker_stop.is_set():
         try:
-            process_due_reservations()
+            # should_continue 使大量积压连续翻页排空时，关停也能在页/条
+            # 边界快速生效（未处理完的到期预约留给下次启动接续）
+            process_due_reservations(
+                should_continue=lambda: not _reservation_worker_stop.is_set()
+            )
         except Exception:  # 连接池暂不可用等：记录后下一周期重试
             logger.exception("到期预约处理轮次失败，将在下一周期重试")
         _reservation_worker_stop.wait(RESERVATION_WORKER_INTERVAL)
@@ -171,7 +240,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.11.0",
+    version="1.12.0",
     description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。安全员还可预约一次未来的批量限行区域调整（POST /api/regions/batch/reservations）：提交带时区执行时刻、预期 revision 与批量变更一致的 operations/trajectories，受理时只校验输入格式（不预占 revision、不保证届时可提交）；预约持久保存，到期由后台执行器按 (execute_at, id) 顺序在与区域写入共用的 region_meta 行锁写事务内重验 revision、操作、轨迹安全与凭证/承诺保护，成功才一次性提交区域变更、revision、观察翻转事件与审计，失败记录沿用批量变更错误码的可查询原因且不改变区域集合；同一预约无论重启或并发处理都至多提交一次，待执行预约可取消（取消与执行竞争只产生一个终态）。",
     lifespan=lifespan,
 )

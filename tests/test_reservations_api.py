@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
-from app import main  # noqa: E402
+from app import main, repository  # noqa: E402
 from app.main import app  # noqa: E402
 
 failures: list[str] = []
@@ -95,9 +95,9 @@ def force_due(rid):
         conn.commit()
 
 
-def process():
+def process(fetch_limit=None):
     """同步执行一轮到期预约（与后台执行器同一处理路径）。"""
-    return main.process_due_reservations()
+    return main.process_due_reservations(fetch_limit=fetch_limit)
 
 
 def revision():
@@ -616,6 +616,156 @@ try:
 finally:
     main.stop_reservation_worker()
 check("后台执行器已停止", True)
+
+# ================================================================ H. 有界取数与持续推进
+print("== H. 有界键集取数：积压增长不使单次取数/内存线性增长 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+
+# 7 条到期预约（expected_revision 全部过期 → 业务失败 failed，互不影响 revision）
+H_IDS = []
+for i in range(7):
+    r = reserve(future(3600), 999,
+                [{"action": "update", "id": 1, "name": f"X-积压{i}"}], [safe_traj()])
+    H_IDS.append(r.json()["id"])
+    force_due(H_IDS[-1])
+
+# 包装有界取数函数：记录每次只读查询实际取回的行数与游标
+orig_page = repository.list_due_reservation_id_page
+page_sizes: list[int] = []
+page_cursors: list = []
+
+
+def tracked_page(cur, now, limit, after_at, after_id):
+    rows = orig_page(cur, now, limit, after_at, after_id)
+    page_sizes.append(len(rows))
+    page_cursors.append((after_at, after_id))
+    return rows
+
+
+repository.list_due_reservation_id_page = tracked_page
+try:
+    processed = process(fetch_limit=3)
+finally:
+    repository.list_due_reservation_id_page = orig_page
+check("7 条到期预约跨页全部处理",
+      sorted(processed) == sorted(H_IDS), f"{processed} vs {H_IDS}")
+# 页大小 3：每次查询 LIMIT 4（多取一行判分页），两次取回 4+4=7，无任何一次取回 7 行
+check("单次取数有界：每次至多 limit+1=4 行（不随积压 7 线性增长）",
+      page_sizes == [4, 4] or (len(page_sizes) >= 2 and max(page_sizes) <= 4
+                               and sum(page_sizes) >= 7),
+      str(page_sizes))
+check("第二页起以 (execute_at, id) 键集游标推进（首页游标为空）",
+      page_cursors[0] == (None, 0)
+      and all(c[1] > 0 for c in page_cursors[1:]), str(page_cursors))
+check("处理顺序按 (execute_at, id) 升序（同积压编号递增）",
+      processed == sorted(processed, key=lambda rid: rid), str(processed))
+check("全部业务失败 → failed 且失败码可查询、revision 不变",
+      all(get_res(rid).json()["status"] == "failed"
+          and get_res(rid).json()["failure"]["code"] == "revision_conflict"
+          for rid in H_IDS) and revision() == 1)
+
+print("== H2. 未预期故障回滚保留 pending、不饿死后续、下轮重试成功 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+# R1：合法预约（首轮注入一次未预期故障，下轮应重试成功）
+r = reserve(future(3600), 1, [{"action": "update", "id": 1, "name": "X-故障恢复"}],
+            [safe_traj()])
+R1 = r.json()["id"]
+# R2：业务必失败（revision 过期 → failed，不推进 revision，便于 R1 下轮成功）
+r = reserve(future(3600), 999, [{"action": "update", "id": 1, "name": "X-后续"}],
+            [safe_traj()])
+R2 = r.json()["id"]
+force_due(R1)
+force_due(R2)
+
+orig_exec = repository.execute_reservation
+attempts: dict[int, int] = {R1: 0, R2: 0}
+boom_done = {"v": False}
+
+
+def flaky_exec(cur, reservation_id):
+    attempts[reservation_id] = attempts.get(reservation_id, 0) + 1
+    if reservation_id == R1 and not boom_done["v"]:
+        boom_done["v"] = True
+        raise RuntimeError("注入的未预期数据库故障")
+    return orig_exec(cur, reservation_id)
+
+
+repository.execute_reservation = flaky_exec
+try:
+    round1 = process(fetch_limit=10)
+    check("首轮：故障条 R1 保持 pending、同轮后续 R2 仍被处理",
+          R1 not in round1 and R2 in round1, str(round1))
+    check("R1 回滚仍 pending（未置 failed）", get_res(R1).json()["status"] == "pending")
+    check("R2 业务拒绝 → failed/revision_conflict",
+          get_res(R2).json()["status"] == "failed"
+          and get_res(R2).json()["failure"]["code"] == "revision_conflict")
+    check("首轮区域/revision 不变", revision() == 1)
+    round2 = process(fetch_limit=10)
+finally:
+    repository.execute_reservation = orig_exec
+check("次轮从头重扫：R1 被重试并 committed",
+      R1 in round2 and get_res(R1).json()["status"] == "committed"
+      and get_res(R1).json()["result"]["revision"] == 2,
+      f"{round2}, {get_res(R1).json()['status']}")
+check("R1 共尝试 2 次、R2 终态后不再重试（仅 1 次）",
+      attempts[R1] == 2 and attempts[R2] == 1, str(attempts))
+check("区域名称为故障恢复后的结果、revision=2",
+      client.get("/api/regions/1").json()["name"] == "X-故障恢复" and revision() == 2)
+
+print("== H3. 处理期间普通 HTTP 请求仍可获得数据库连接 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+r = reserve(future(3600), 1, [{"action": "update", "id": 1, "name": "X-连接占用"}],
+            [safe_traj()])
+R3 = r.json()["id"]
+force_due(R3)
+
+inside_txn = threading.Event()
+release_txn = threading.Event()
+http_results: list = []
+
+
+def blocking_exec(cur, reservation_id):
+    # 执行器正持有一条池连接、在独立写事务内处理该预约
+    inside_txn.set()
+    release_txn.wait(timeout=10)
+    return orig_exec(cur, reservation_id)
+
+
+def worker_run():
+    process(fetch_limit=10)
+
+
+repository.execute_reservation = blocking_exec
+t_worker = threading.Thread(target=worker_run)
+t_worker.start()
+try:
+    assert inside_txn.wait(timeout=10), "执行器未进入写事务"
+    # 此刻后台写事务仍开放：并发发起多个需要数据库连接的普通 HTTP 请求
+    def http_get():
+        rr = client.get("/api/revision")
+        http_results.append(rr.status_code)
+        rr2 = client.get("/api/regions")
+        http_results.append(rr2.status_code)
+
+    http_threads = [threading.Thread(target=http_get) for _ in range(5)]
+    for t in http_threads:
+        t.start()
+    for t in http_threads:
+        t.join(timeout=15)
+    check("处理单条预约期间 10 个普通 HTTP 请求全部 200（连接未被执行器耗尽）",
+          len(http_results) == 10 and all(code == 200 for code in http_results),
+          str(http_results))
+finally:
+    repository.execute_reservation = orig_exec
+    release_txn.set()
+    t_worker.join(timeout=15)
+check("放行后预约正常 committed", get_res(R3).json()["status"] == "committed")
 
 # ================================================================ 清理
 reset_all()

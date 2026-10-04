@@ -1839,17 +1839,44 @@ def cancel_reservation(cur, reservation_id: int) -> dict | None:
     return cur.fetchone()
 
 
-def list_due_reservation_ids(cur, now: datetime) -> list[int]:
-    """到期待执行预约编号：按执行时刻升序、同刻按编号升序（处理顺序）。"""
+def list_due_reservation_id_page(
+    cur,
+    now: datetime,
+    limit: int,
+    after_execute_at: datetime | None = None,
+    after_id: int = 0,
+) -> list[dict]:
+    """有界键集翻页：按 (execute_at, id) 升序取一页到期待执行预约。
+
+    只在一次**只读**短查询内返回 execute_at <= now、且严格位于键集游标
+    (after_execute_at, after_id) 之后的 pending 行，至多 ``limit + 1`` 行
+    （多取一行仅用于判定是否还有下一页）；命中
+    idx_batch_reservations_due (status, execute_at, id) 索引，单次取数
+    与内存占用只与页大小有关、不随待执行积压总量线性增长。
+
+    返回行含 execute_at 与 id（不读 payload，避免一页内持有全部预约的
+    完整请求体）；具体执行由调用方逐条在独立写事务内完成。未取行锁，
+    因此多实例可同时枚举到同一编号——并发安全由 execute_reservation 的
+    预约行 FOR UPDATE 与同事务状态翻转保证（同一预约至多提交一次）。
+    """
     cur.execute(
         """
-        SELECT id FROM batch_reservations
-        WHERE status = 'pending' AND execute_at <= %s
+        SELECT execute_at, id FROM batch_reservations
+        WHERE status = 'pending' AND execute_at <= %(now)s::timestamptz
+          AND (%(after_at)s::timestamptz IS NULL
+               OR execute_at > %(after_at)s::timestamptz
+               OR (execute_at = %(after_at)s::timestamptz AND id > %(after_id)s))
         ORDER BY execute_at ASC, id ASC
+        LIMIT %(limit)s
         """,
-        (now,),
+        {
+            "now": now,
+            "after_at": after_execute_at,
+            "after_id": after_id,
+            "limit": limit + 1,
+        },
     )
-    return [r["id"] for r in cur.fetchall()]
+    return cur.fetchall()
 
 
 def execute_reservation(cur, reservation_id: int) -> dict | None:
