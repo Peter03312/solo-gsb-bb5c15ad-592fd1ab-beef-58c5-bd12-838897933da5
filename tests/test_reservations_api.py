@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app import main  # noqa: E402
+from app import repository  # noqa: E402
 from app.main import app  # noqa: E402
 
 failures: list[str] = []
@@ -616,6 +617,262 @@ try:
 finally:
     main.stop_reservation_worker()
 check("后台执行器已停止", True)
+# 等后台线程越过可能正在进行的一轮的取数点，避免它处理到下一节重置后的数据
+time.sleep(main.RESERVATION_WORKER_INTERVAL + 0.2)
+
+# ================================================================ H. 有界分页取数
+print("== H. 有界取数与持续推进：积压不随总量线性增长，翻页处理全部到期预约 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+
+TOTAL = 7
+rids = []
+for i in range(TOTAL):
+    # 均预期 revision=1：第 1 条（编号最小）committed，其余随后看到 rev=2
+    r = reserve(future(3600 + i), 1,
+                [{"action": "update", "id": 1, "name": f"X-分页{i}"}], [safe_traj()])
+    assert r.status_code == 201, r.text
+    rids.append(r.json()["id"])
+    force_due(rids[-1])
+
+# 有界取数原语：每页严格按 (execute_at, id) keyset 推进，单页行数有上界
+with db.pool.connection() as conn:
+    conn.rollback()
+    with conn.cursor() as cur:
+        repository.configure_cursor(cur)
+        now = repository.utcnow()
+        p1 = repository.list_due_reservation_ids(cur, now, limit=3)
+        p2 = repository.list_due_reservation_ids(
+            cur, now, limit=3,
+            after_execute_at=p1[-1]["execute_at"], after_id=p1[-1]["id"])
+        p3 = repository.list_due_reservation_ids(
+            cur, now, limit=3,
+            after_execute_at=p2[-1]["execute_at"], after_id=p2[-1]["id"])
+    conn.commit()
+ids_pages = [[r["id"] for r in p] for p in (p1, p2, p3)]
+check("单页取数以 limit 为界（3/3/1）", [len(p) for p in ids_pages] == [3, 3, 1],
+      str(ids_pages))
+check("页间无重复无遗漏、按 id 升序",
+      sum(ids_pages, []) == rids and all(len(set(p)) == len(p) for p in ids_pages),
+      str(ids_pages))
+
+old_size = main.RESERVATION_FETCH_BATCH_SIZE
+main.RESERVATION_FETCH_BATCH_SIZE = 3  # 7 条到期预约 ⇒ 至少 3 页
+try:
+    processed = process()
+finally:
+    main.RESERVATION_FETCH_BATCH_SIZE = old_size
+check("跨页持续推进：全部到期预约一轮处理完",
+      sorted(processed) == sorted(rids), str(processed))
+check("第 1 条 committed、其余 failed/revision_conflict（顺序语义保留）",
+      get_res(rids[0]).json()["status"] == "committed"
+      and all(get_res(rid).json()["failure"]["code"] == "revision_conflict"
+              for rid in rids[1:]),
+      str([(rid, get_res(rid).json()["status"]) for rid in rids]))
+check("积压处理后 revision=2（只第一条推进）", revision() == 2, str(revision()))
+
+# ================================================================ I. 未预期故障：回滚、退避、不饿死
+print("== I. 未预期故障回滚保留 pending 并退避；同轮继续处理其余到期预约 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+
+# 两条到期预约：前一条执行时注入未预期故障，后一条正常
+r = reserve(future(3600), 1, [{"action": "update", "id": 1, "name": "X-故障条"}],
+            [safe_traj()])
+RID_BAD = r.json()["id"]
+r = reserve(future(3601), 2, [{"action": "update", "id": 1, "name": "X-正常条"}],
+            [safe_traj()])
+RID_OK2 = r.json()["id"]
+force_due(RID_BAD)
+force_due(RID_OK2)
+
+real_apply_batch = repository.apply_batch
+
+
+def apply_batch_boom(cur, payload, trajectories):
+    names = [getattr(op, "name", None) for op in payload.operations]
+    if "X-故障条" in names:
+        raise RuntimeError("注入的未预期数据库故障")
+    return real_apply_batch(cur, payload, trajectories)
+
+
+repository.apply_batch = apply_batch_boom
+old_base = main.RESERVATION_RETRY_BASE_DELAY
+main.RESERVATION_RETRY_BASE_DELAY = 0.05  # 缩短退避便于后续验证恢复
+try:
+    processed = process()
+finally:
+    repository.apply_batch = real_apply_batch
+    main.RESERVATION_RETRY_BASE_DELAY = old_base
+
+# 故障条：事务回滚，仍 pending、无 result/failure/executed_at，区域未被改
+b = get_res(RID_BAD).json()
+check("未预期故障后预约保持 pending（可后续重试）", b["status"] == "pending", str(b))
+check("故障条无 result/failure/executed_at（事务已回滚）",
+      b["result"] is None and b["failure"] is None and b["executed_at"] is None, str(b))
+check("故障条未改区域名称、revision 仍=1",
+      client.get("/api/regions/1").json()["name"] == "X区" and revision() == 1)
+# 退避簿记：attempts+1、next_attempt_at 推到未来
+with db.pool.connection() as conn:
+    conn.rollback()
+    with conn.cursor() as cur:
+        repository.configure_cursor(cur)
+        cur.execute(
+            "SELECT attempts, next_attempt_at FROM batch_reservations WHERE id = %s",
+            (RID_BAD,),
+        )
+        book = cur.fetchone()
+    conn.commit()
+check("故障条退避簿记 attempts=1 且 next_attempt_at 推到未来",
+      book is not None and book["attempts"] == 1
+      and book["next_attempt_at"] > repository.utcnow(), str(book))
+# 同轮不饿死：后一条正常预约已处理（它预期 rev=2，因故障条回滚仍 rev=1
+# 而 revision_conflict 落 failed——重点是它确实被处理到了）
+check("同轮继续推进后续到期预约（不被故障条饿死）",
+      RID_OK2 in processed
+      and get_res(RID_OK2).json()["status"] == "failed"
+      and get_res(RID_OK2).json()["failure"]["code"] == "revision_conflict",
+      str(processed))
+
+# 退避期内不重试；退避期满（或重启后接续）重试成功，只提交一次
+processed_now = process()
+check("退避期内不取故障条（仍 pending）",
+      RID_BAD not in processed_now and get_res(RID_BAD).json()["status"] == "pending",
+      str(processed_now))
+time.sleep(0.15)  # 超过 0.05s 退避
+processed = process()
+b = get_res(RID_BAD).json()
+check("退避期满后续期重试成功 → committed",
+      RID_BAD in processed and b["status"] == "committed"
+      and b["result"]["revision"] == 2, str(b))
+check("恢复后区域名为故障条预约的结果、revision=2",
+      client.get("/api/regions/1").json()["name"] == "X-故障条" and revision() == 2)
+check("重试成功后 attempts 簿记保留（不再增长）",
+      get_res(RID_BAD).json()["status"] == "committed")
+
+# 业务拒绝（非未预期故障）直接 failed，不写退避簿记
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+r = reserve(future(3600), 1, [{"action": "update", "id": 1, "name": "X-业务失败"}],
+            [safe_traj()])
+RID_BIZ = r.json()["id"]
+client.patch("/api/regions/1", json={"name": "X-外部"})
+force_due(RID_BIZ)
+process()
+with db.pool.connection() as conn:
+    conn.rollback()
+    with conn.cursor() as cur:
+        repository.configure_cursor(cur)
+        cur.execute(
+            "SELECT attempts, next_attempt_at, status FROM batch_reservations WHERE id = %s",
+            (RID_BIZ,),
+        )
+        book = cur.fetchone()
+    conn.commit()
+check("业务拒绝直接 failed 且不经退避簿记（attempts=0）",
+      book["status"] == "failed" and book["attempts"] == 0, str(book))
+
+# ================================================================ J. 多实例：SKIP LOCKED 互不阻塞
+print("== J. 多实例并发：行被锁时 SKIP LOCKED 跳过、不阻塞，最终至多提交一次 ==")
+reset_all()
+client.post("/api/regions", json={
+    "name": "X区", "polygon": BOX_A, "valid_from": WIDE[0], "valid_to": WIDE[1]})
+r1 = reserve(future(3600), 1, [{"action": "update", "id": 1, "name": "X-锁内"}],
+             [safe_traj()])
+RID_LOCK = r1.json()["id"]
+r2 = reserve(future(3601), 2, [{"action": "update", "id": 1, "name": "X-锁外"}],
+             [safe_traj()])
+RID_FREE = r2.json()["id"]
+force_due(RID_LOCK)
+force_due(RID_FREE)
+
+# 另一个事务（模拟另一实例/取消请求）在独立连接上持住 RID_LOCK 的行锁不提交。
+# 注意：psycopg 连接池按线程复用连接，process() 必须在另一个线程里运行，
+# 否则会拿到持锁事务所在的同一条连接（其开头的 rollback 会释放行锁）
+held = {"processed": None, "error": None}
+
+with db.pool.connection() as holder:
+    holder.rollback()
+    with holder.cursor() as hcur:
+        hcur.execute(
+            "SELECT id FROM batch_reservations WHERE id = %s FOR UPDATE",
+            (RID_LOCK,),
+        )
+        hcur.fetchone()
+
+    def run_process_while_locked():
+        try:
+            held["processed"] = process()
+        except Exception as exc:  # pragma: no cover - 仅用于失败定位
+            held["error"] = exc
+
+    t_proc = threading.Thread(target=run_process_while_locked)
+    t_proc.start()
+    t_proc.join(timeout=15)
+    check("持锁期间执行器线程正常结束（SKIP LOCKED 不等待、不死锁）",
+          t_proc.is_alive() is False and held["error"] is None, str(held["error"]))
+    processed = held["processed"] or []
+    check("被其它事务持锁的预约本轮跳过（SKIP LOCKED 不等待）",
+          RID_LOCK not in processed and get_res(RID_LOCK).json()["status"] == "pending",
+          str(processed))
+    check("持锁不阻塞后续到期预约处理",
+          RID_FREE in processed
+          and get_res(RID_FREE).json()["failure"]["code"] == "revision_conflict",
+          str(processed))
+# 持锁事务回滚释放（模拟对端中止）：下一轮该预约正常被执行
+holder.rollback()
+processed = process()
+check("锁释放后下一轮接续执行 → committed（至多提交一次）",
+      RID_LOCK in processed and get_res(RID_LOCK).json()["status"] == "committed"
+      and revision() == 2, str(processed))
+
+# ================================================================ K. 处理积压期间普通请求可得连接
+print("== K. 大积压一轮处理期间，普通 HTTP 请求仍可获得数据库连接 ==")
+reset_all()
+N_BIG = 120
+for i in range(N_BIG):
+    r = reserve(future(3600 + i), 0,
+                [{"action": "update", "id": 999, "name": f"X-不存在{i}"}],
+                [safe_traj()])  # 区域 999 不存在 → failed/region_not_found
+    force_due(r.json()["id"])
+
+interleaved: list = []
+old_size = main.RESERVATION_FETCH_BATCH_SIZE
+main.RESERVATION_FETCH_BATCH_SIZE = 25
+stop_poke = threading.Event()
+
+
+def poke_http():
+    # 与执行器并发的普通只读 HTTP 请求：每次都应快速拿到连接并 200
+    while not stop_poke.is_set():
+        t0 = time.time()
+        rr = client.get("/api/revision")
+        interleaved.append((rr.status_code, time.time() - t0))
+        time.sleep(0.002)
+
+
+t_poke = threading.Thread(target=poke_http)
+t_poke.start()
+try:
+    t0 = time.time()
+    processed = process()
+    elapsed = time.time() - t0
+finally:
+    stop_poke.set()
+    t_poke.join()
+    main.RESERVATION_FETCH_BATCH_SIZE = old_size
+check("大积压一轮全部处理（120 条跨多页）", len(processed) == N_BIG,
+      f"{len(processed)}/{N_BIG}")
+check("全部业务拒绝 failed/region_not_found、revision 不变",
+      revision() == 0 and len(processed) == N_BIG)
+check("处理期间并发只读请求全部 200 且快速返回（连接未被执行器占满）",
+      bool(interleaved) and all(code == 200 for code, _ in interleaved)
+      and max(d for _, d in interleaved) < 5.0,
+      f"请求数={len(interleaved)}, 最慢={max((d for _, d in interleaved), default=0):.3f}s, "
+      f"处理耗时={elapsed:.2f}s")
 
 # ================================================================ 清理
 reset_all()

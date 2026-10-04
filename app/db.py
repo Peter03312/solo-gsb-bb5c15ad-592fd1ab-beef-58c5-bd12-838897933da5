@@ -20,6 +20,12 @@ DATABASE_URL = os.environ.get(
 )
 DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "30"))
 DB_CONNECT_INTERVAL = float(os.environ.get("DB_CONNECT_INTERVAL", "1.0"))
+# 连接池容量可配：到期预约执行器每轮只短时占用 1 条连接，池的其余容量
+# 始终留给普通 HTTP 请求；max_size 给定时长仍无法取得连接的请求快速失败，
+# 避免请求线程被无限挂起
+DB_POOL_MIN_SIZE = int(os.environ.get("DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_SIZE = int(os.environ.get("DB_POOL_MAX_SIZE", "10"))
+DB_POOL_TIMEOUT = float(os.environ.get("DB_POOL_TIMEOUT", "10.0"))
 
 pool: ConnectionPool | None = None
 
@@ -188,9 +194,11 @@ CREATE TABLE IF NOT EXISTS region_change_audit (
 -- 取出，在与区域写入共用的 region_meta 行锁写事务内重验 revision、操作、
 -- 轨迹安全与凭证/承诺保护：成功则一次性提交区域变更并把本行置为
 -- committed（提交结果入 result）；失败则区域集合不变，本行置为 failed
--- 并记录沿用批量变更错误码的可查询原因（failure）。预约行在执行事务内
--- FOR UPDATE 锁定，状态翻转与区域变更同一事务提交，因此无论重启还是
--- 并发处理，同一预约至多提交一次；pending 预约可取消，取消与执行在同一
+-- 并记录沿用批量变更错误码的可查询原因（failure）。执行器有界分页取数，
+-- 预约行在执行事务内 FOR UPDATE SKIP LOCKED 认领，状态翻转与区域变更
+-- 同一事务提交，因此无论崩溃重启还是多实例并发处理，同一预约至多提交
+-- 一次；未预期故障回滚后预约保持 pending 并按 attempts/next_attempt_at
+-- 指数退避，不饿死其后的到期预约；pending 预约可取消，取消与执行在同一
 -- 行锁上竞争，只产生一个终态。
 CREATE TABLE IF NOT EXISTS batch_reservations (
     id              BIGSERIAL PRIMARY KEY,
@@ -209,12 +217,27 @@ CREATE TABLE IF NOT EXISTS batch_reservations (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     executed_at     TIMESTAMPTZ,
     cancelled_at    TIMESTAMPTZ,
+    -- 未预期故障（数据库错误等）回滚重试簿记：业务重验失败直接落 failed，
+    -- 不经过这两列。attempts 为已发生的未预期故障次数（从 0 开始），
+    -- next_attempt_at 为指数退避后的最早重试时刻——反复故障的单条预约
+    -- 会被暂时跳过，同轮继续推进其后的到期预约（不饿死后续任务）；
+    -- 退避不改变终态语义，故障恢复后预约仍被执行，崩溃重启可接续；
+    -- 默认 1970 纪元起点表示从未退避、立即可重试
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z',
     CONSTRAINT batch_reservations_status_check
         CHECK (status IN ('pending', 'committed', 'failed', 'cancelled'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_batch_reservations_due
     ON batch_reservations (status, execute_at, id);
+
+-- 既有库升级：为到期预约的未预期故障退避补充两列（与建表语句一致，
+-- 不改变任何现有行：next_attempt_at 置为 epoch 起点立即可重试）
+ALTER TABLE batch_reservations ADD COLUMN IF NOT EXISTS
+    attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE batch_reservations ADD COLUMN IF NOT EXISTS
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z';
 """
 
 
@@ -243,7 +266,13 @@ def init_pool() -> ConnectionPool:
     global pool
     last_exc: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
-        pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False)
+        pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=DB_POOL_MIN_SIZE,
+            max_size=DB_POOL_MAX_SIZE,
+            timeout=DB_POOL_TIMEOUT,
+            open=False,
+        )
         try:
             pool.open()
             with pool.connection() as conn:

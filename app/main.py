@@ -77,58 +77,142 @@ logger = logging.getLogger("restriction-service")
 
 # ---------------------------------------------------------------- 到期预约执行器
 
-# 后台线程轮询间隔（秒）：到期预约按 (execute_at, id) 顺序逐个执行
+# 后台线程轮询间隔（秒）：到期预约按 (execute_at, id) 顺序分页推进
 RESERVATION_WORKER_INTERVAL = float(
     os.environ.get("RESERVATION_WORKER_INTERVAL", "0.5")
+)
+# 单页取数上界：每轮从库里按 (execute_at, id) 顺序只取这么多到期预约编号，
+# 处理完再翻下一页。待执行积压增长时，单次查询返回行数与进程内待处理列表
+# 都以该值为上界，不随 pending 总量线性增长
+RESERVATION_FETCH_BATCH_SIZE = int(
+    os.environ.get("RESERVATION_FETCH_BATCH_SIZE", "100")
+)
+# 未预期故障（数据库故障等，非业务重验失败）回滚后的指数退避：预约保持
+# pending，最早重试时刻推后 min(BASE * 2**已失败次数, MAX) 秒，使反复
+# 故障的单条预约暂时让路、同轮继续推进其后的到期预约（不饿死后续任务）；
+# 退避期满或服务重启后仍按 (execute_at, id) 接续重试
+RESERVATION_RETRY_BASE_DELAY = float(
+    os.environ.get("RESERVATION_RETRY_BASE_DELAY", "1.0")
+)
+RESERVATION_RETRY_MAX_DELAY = float(
+    os.environ.get("RESERVATION_RETRY_MAX_DELAY", "60.0")
 )
 _reservation_worker_stop = threading.Event()
 _reservation_worker_thread: threading.Thread | None = None
 
 
-def process_due_reservations() -> list[int]:
-    """处理全部到期待执行预约，返回本轮处理过的预约编号（按处理顺序）。
+def process_due_reservations(stop_event: threading.Event | None = None) -> list[int]:
+    """有界、持续推进地处理到期待执行预约，返回本轮到达终态的预约编号。
 
-    到期集合按 (execute_at, id) 升序取出后逐个在**独立写事务**内执行：
-    每条预约的重验、区域变更与状态翻转同一事务提交，单条失败（含未预期
-    错误回滚留待下轮重试）不影响后续预约。执行器与取消在同一预约行锁上
-    竞争，与所有区域写入在 region_meta 行锁上串行化。
+    ``stop_event`` 给定时，翻页/逐条处理前检查它是否被置位（后台执行器
+    停机用）；为 None 时不受执行器生命周期影响，调用方（测试、运维脚本）
+    总能同步跑完一整轮。
+
+    每轮的到期判定时刻在轮次开始时固定，按 **(execute_at, id) 升序**做
+    keyset 分页，每页至多 ``RESERVATION_FETCH_BATCH_SIZE`` 条编号（只读、
+    不锁定，单次取数与内存占用不随积压规模线性增长）；每条预约在**独立
+    写事务**内以 ``FOR UPDATE SKIP LOCKED`` 认领后重验执行：
+
+    * 重验、区域变更与状态翻转同一事务提交；业务重验失败在事务内落
+      failed（沿用批量变更错误码），不影响后续预约；
+    * 未预期故障（数据库故障等）整事务回滚、预约保持 pending，并在另一个
+      独立短事务内登记指数退避；本轮继续处理其余到期预约，反复故障的单条
+      因退避被暂时跳过，不能饿死其后的预约；
+    * 行正被其它实例/取消事务锁定时 ``SKIP LOCKED`` 立即跳过，不等待——
+      多实例并发运行时同一预约至多提交一次；取消与执行只产生一个终态。
+
+    每次查询/执行都从连接池短时借还连接（至多占用 1 条），普通 HTTP
+    请求在积压处理期间始终能取得连接。
     """
+    def stopping() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
     processed: list[int] = []
-    with db.pool.connection() as conn:
-        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
-        with conn.cursor() as cur:
-            repository.configure_cursor(cur)
-            due_ids = repository.list_due_reservation_ids(
-                cur, repository.utcnow()
-            )
-        conn.commit()  # 只读取出到期集合，释放快照
-        for reservation_id in due_ids:
-            conn.rollback()
+    round_now = repository.utcnow()
+    after_execute_at: datetime | None = None
+    after_id: int | None = None
+    while not stopping():
+        # 1) 只读取一页到期编号（单语句只读事务，提交即还连接与快照）
+        with db.pool.connection() as conn:
+            conn.rollback()  # 确保从连接池拿到的连接没有残留事务
             with conn.cursor() as cur:
                 repository.configure_cursor(cur)
+                page = repository.list_due_reservation_ids(
+                    cur,
+                    round_now,
+                    RESERVATION_FETCH_BATCH_SIZE,
+                    after_execute_at,
+                    after_id,
+                )
+            conn.commit()  # 只读取号：提交以释放快照，本页不加任何行锁
+        if not page:
+            break  # 本轮没有更多到期（或处于退避期）的 pending 预约
+
+        # 2) 逐条在独立写事务内认领（SKIP LOCKED）并重验执行
+        for item in page:
+            if stopping():
+                return processed
+            reservation_id = item["id"]
+            needs_backoff = False
+            row = None
+            with db.pool.connection() as conn:
+                conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+                with conn.cursor() as cur:
+                    repository.configure_cursor(cur)
+                    try:
+                        row = repository.execute_reservation(cur, reservation_id)
+                    except Exception:
+                        # 未预期错误（如数据库故障）：整事务回滚，预约保持
+                        # pending；随后另开独立短事务登记指数退避并继续下一
+                        # 条。业务重验失败已在 execute_reservation 内落为
+                        # failed，不会走到这里
+                        conn.rollback()
+                        needs_backoff = True
+                        logger.exception(
+                            "预约 %s 执行出现未预期错误，回滚并按退避留待后续重试",
+                            reservation_id,
+                        )
+                    else:
+                        conn.commit()
+            if needs_backoff:
                 try:
-                    row = repository.execute_reservation(cur, reservation_id)
+                    with db.pool.connection() as backoff_conn:
+                        backoff_conn.rollback()
+                        with backoff_conn.cursor() as backoff_cur:
+                            repository.configure_cursor(backoff_cur)
+                            repository.mark_reservation_retry(
+                                backoff_cur,
+                                reservation_id,
+                                RESERVATION_RETRY_BASE_DELAY,
+                                RESERVATION_RETRY_MAX_DELAY,
+                            )
+                        backoff_conn.commit()
                 except Exception:
-                    # 未预期错误（如数据库故障）：整事务回滚，预约保持
-                    # pending，下一轮（或重启后）重试；业务重验失败已在
-                    # execute_reservation 内落为 failed，不会走到这里
-                    conn.rollback()
+                    # 退避登记失败也不影响推进：预约仍为 pending，下一轮
+                    # 按无退避重新尝试
                     logger.exception(
-                        "预约 %s 执行出现未预期错误，留待下一轮重试", reservation_id
+                        "预约 %s 退避登记失败，下一轮将直接重试",
+                        reservation_id,
                     )
-                    continue
-                else:
-                    conn.commit()
-            # 仅统计本轮真正执行的预约（取出到加锁之间被并发取消/执行的除外）
+                continue
+            # 仅统计本轮真正到达终态的预约；行不存在、被并发实例锁定/取消
+            # 的（row 为 None 或仍 pending）不计入
             if row is not None and row["status"] in ("committed", "failed"):
                 processed.append(reservation_id)
+
+        # 3) keyset 翻页：从本页最后一条之后继续取（严格顺序推进）
+        last = page[-1]
+        after_execute_at = last["execute_at"]
+        after_id = last["id"]
+        if len(page) < RESERVATION_FETCH_BATCH_SIZE:
+            break
     return processed
 
 
 def _reservation_worker_loop() -> None:
     while not _reservation_worker_stop.is_set():
         try:
-            process_due_reservations()
+            process_due_reservations(_reservation_worker_stop)
         except Exception:  # 连接池暂不可用等：记录后下一周期重试
             logger.exception("到期预约处理轮次失败，将在下一周期重试")
         _reservation_worker_stop.wait(RESERVATION_WORKER_INTERVAL)
@@ -171,8 +255,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.11.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。安全员还可预约一次未来的批量限行区域调整（POST /api/regions/batch/reservations）：提交带时区执行时刻、预期 revision 与批量变更一致的 operations/trajectories，受理时只校验输入格式（不预占 revision、不保证届时可提交）；预约持久保存，到期由后台执行器按 (execute_at, id) 顺序在与区域写入共用的 region_meta 行锁写事务内重验 revision、操作、轨迹安全与凭证/承诺保护，成功才一次性提交区域变更、revision、观察翻转事件与审计，失败记录沿用批量变更错误码的可查询原因且不改变区域集合；同一预约无论重启或并发处理都至多提交一次，待执行预约可取消（取消与执行竞争只产生一个终态）。",
+    version="1.12.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员还可把尚未取消、窗口未结束的承诺兑现为一张固定时刻通行凭证（POST /api/commitments/{id}/fulfill）：在与区域变更、承诺取消及凭证签发共用的写事务内重验出发时刻晚于受理时刻、落在原候选窗口与按当前区域集合重算的安全出发区间内，成功后原承诺按既有取消语义失效、只生成一张凭证，区域 revision 不变，并发兑现至多一次成功且失败方可区分已兑现与普通取消；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）在同一事务追加只读可分页的区域集合变更审计历史，并支持 Idempotency-Key 幂等重试；安全员还可对固定行程做最小区域豁免预演（只读）：在可豁免候选区域的子集中找出使候选窗口内存在安全出发时刻的最优方案（豁免数最少、最早安全时刻、编号字典序），预演不改变任何数据；也可对多区调整做批量变更影响预演（只读）：基于同一已提交快照报告各轨迹安全结论与穿越明细、将冲突的通行凭证、将被清空的择时承诺与观察结论净翻转，预演不改变任何数据、不占用区域编号。安全员还可预约一次未来的批量限行区域调整（POST /api/regions/batch/reservations）：提交带时区执行时刻、预期 revision 与批量变更一致的 operations/trajectories，受理时只校验输入格式（不预占 revision、不保证届时可提交）；预约持久保存，到期由后台执行器有界分页取数、按 (execute_at, id) 顺序持续推进，每条在与区域写入共用的 region_meta 行锁写事务内以 FOR UPDATE SKIP LOCKED 认领后重验处理时的 revision、操作、轨迹安全与凭证/承诺状态，成功才一次性提交区域变更、revision、观察翻转事件与审计；业务拒绝记录沿用批量变更错误码的可查询原因并置 failed、不改变区域集合，未预期故障整事务回滚后预约保持 pending 并指数退避、同轮继续处理其余到期预约（反复故障的单条不饿死后续任务）；无论重启或多实例并发，同一预约都至多提交一次，待执行预约可取消（取消与执行竞争只产生一个终态），有界取数不随待执行积压线性增长。",
     lifespan=lifespan,
 )
 

@@ -1839,40 +1839,117 @@ def cancel_reservation(cur, reservation_id: int) -> dict | None:
     return cur.fetchone()
 
 
-def list_due_reservation_ids(cur, now: datetime) -> list[int]:
-    """到期待执行预约编号：按执行时刻升序、同刻按编号升序（处理顺序）。"""
+def list_due_reservation_ids(
+    cur,
+    now: datetime,
+    limit: int,
+    after_execute_at: datetime | None = None,
+    after_id: int | None = None,
+) -> list[dict]:
+    """有界取数：取至多 ``limit`` 条到期待执行预约（编号与执行时刻）。
+
+    按 **(execute_at, id) 升序**（处理顺序）支持 keyset 翻页：
+    ``after_execute_at``/``after_id`` 为上一页最后一条的位置，后续页只取
+    严格在其后的行。无论待执行预约增长到多少，单次查询与单页内存占用都
+    以 ``limit`` 为上界，不随积压规模线性增长。
+
+    ``next_attempt_at <= now`` 过滤掉处于未预期故障退避期内的预约
+    （业务重验失败的预约已是 failed，本就不会出现）。调用方应在只读
+    事务（或自动提交）中调用；本函数**不锁定**预约行——加锁在每条预约
+    各自的写事务内以 ``FOR UPDATE SKIP LOCKED`` 完成，因此多执行器/多
+    实例并发轮询同一张待执行清单不会互相阻塞，锁竞争只发生在行级。
+    """
+    if after_execute_at is None:
+        cur.execute(
+            """
+            SELECT id, execute_at FROM batch_reservations
+            WHERE status = 'pending'
+              AND execute_at <= %(now)s
+              AND next_attempt_at <= %(now)s
+            ORDER BY execute_at ASC, id ASC
+            LIMIT %(limit)s
+            """,
+            {"now": now, "limit": limit},
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, execute_at FROM batch_reservations
+            WHERE status = 'pending'
+              AND execute_at <= %(now)s
+              AND next_attempt_at <= %(now)s
+              AND (execute_at, id) > (%(after_execute_at)s, %(after_id)s)
+            ORDER BY execute_at ASC, id ASC
+            LIMIT %(limit)s
+            """,
+            {
+                "now": now,
+                "limit": limit,
+                "after_execute_at": after_execute_at,
+                "after_id": after_id,
+            },
+        )
+    return cur.fetchall()
+
+
+def mark_reservation_retry(
+    cur, reservation_id: int, base_delay: float, max_delay: float
+) -> bool:
+    """未预期故障回滚后，在**独立短事务**内登记一次重试退避。
+
+    预约保持 pending：尝试次数 +1，并把最早重试时刻推后为
+    ``min(base_delay * 2**attempts, max_delay)``（按故障前的旧次数计，
+    即首次故障退 base_delay 秒），使反复故障的单条预约暂时让路、不饿死
+    其后的到期预约；退避期满（以及服务重启后）仍按 (execute_at, id)
+    接续重试。仅当行仍为 pending 时更新（与取消竞争时取消赢则不动）。
+
+    返回是否成功登记（False：行已不存在或不再是 pending，无需再退避）。
+    """
     cur.execute(
         """
-        SELECT id FROM batch_reservations
-        WHERE status = 'pending' AND execute_at <= %s
-        ORDER BY execute_at ASC, id ASC
+        UPDATE batch_reservations
+        SET attempts = attempts + 1,
+            next_attempt_at = now()
+                + make_interval(
+                    secs => LEAST(%(base)s::double precision
+                                  * power(2.0, attempts),
+                                  %(max)s::double precision))
+        WHERE id = %(id)s AND status = 'pending'
         """,
-        (now,),
+        {"base": base_delay, "max": max_delay, "id": reservation_id},
     )
-    return [r["id"] for r in cur.fetchall()]
+    return cur.rowcount > 0
 
 
 def execute_reservation(cur, reservation_id: int) -> dict | None:
     """在单个写事务内执行一条到期预约（重验 + 一次性提交 + 状态翻转）。
 
     * 预约不存在：返回 None；
+    * 行正被其它执行器/取消事务锁定：返回 ``None``（``SKIP LOCKED``，
+      不等待）——调用方视为本轮未处理；持锁事务提交后，下一轮按终态
+      跳过或按 pending 重试；
     * 已非 pending（已取消/已提交/已失败）：直接返回当前行——同一预约
       无论重启还是并发处理都至多提交一次（状态翻转与区域变更同事务，
-      预约行 FOR UPDATE 锁定使并发执行器串行，后到者读到终态即跳过）；
+      预约行 ``FOR UPDATE SKIP LOCKED`` 使并发执行器互不等待，后到者
+      读到终态即跳过）；
     * pending：重建规范化批量请求，调用 apply_batch 在与现有区域写入
       共用的 region_meta 行锁内重验 revision、操作、轨迹安全与凭证/
       承诺保护。成功则区域、revision、观察翻转事件与审计一次性落库，
       本行置 committed 并记录提交结果；重验失败（沿用批量变更错误码）
       时 apply_batch 在任何区域写入之前抛出，本行置 failed 并记录可
       查询原因，区域集合不变。
+
+    注意：本函数范围外的异常（数据库故障等）由调用方回滚整个事务并通过
+    mark_reservation_retry 登记退避；预约保持 pending 供后续重试。
     """
     cur.execute(
         "SELECT " + _RESERVATION_COLUMNS
-        + " FROM batch_reservations WHERE id = %s FOR UPDATE",
+        + " FROM batch_reservations WHERE id = %s FOR UPDATE SKIP LOCKED",
         (reservation_id,),
     )
     row = cur.fetchone()
     if row is None:
+        # 行不存在，或正被并发执行器/取消事务锁定：本轮跳过，不阻塞
         return None
     if row["status"] != "pending":
         return row
